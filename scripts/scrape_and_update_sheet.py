@@ -18,7 +18,6 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from xml.etree import ElementTree
 
 import gspread
@@ -114,10 +113,8 @@ async def main():
 
     print(f"[i] Total de URLs encontradas: {len(urls)}", file=sys.stderr)
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    rows = [["URL", "Última comprobación"]]
-    rows.extend([u, now] for u in urls)
+    rows = [["URL"]]
+    rows.extend([u] for u in urls)
 
     print("[i] Escribiendo en Google Sheets (se borra el contenido anterior)...", file=sys.stderr)
     ws = get_sheet()
