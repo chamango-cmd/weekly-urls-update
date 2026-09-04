@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Recorre un sitemap_index.xml (con Playwright, para sortear el WAF de
-Cloudflare), extrae Title / H1 / Meta Description de cada URL, y escribe
-el resultado en una hoja de Google Sheets.
+Cloudflare) y escribe la lista de URLs encontradas en una pestaña de
+Google Sheets. Cada ejecución borra el contenido anterior de la pestaña
+y escribe la lista actualizada desde cero.
 
 Variables de entorno requeridas:
     SITEMAP_INDEX_URL              URL del sitemap_index.xml
@@ -11,14 +12,11 @@ Variables de entorno requeridas:
     GOOGLE_SHEET_ID                ID de la hoja de cálculo (de la URL)
     SHEET_TAB_NAME                 (opcional) nombre de la pestaña, por
                                     defecto "Sitemap URLs"
-    CONCURRENCY                    (opcional) páginas en paralelo, por
-                                    defecto 5
 """
 
 import asyncio
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone
 from xml.etree import ElementTree
@@ -36,7 +34,6 @@ UA = (
 SITEMAP_INDEX_URL = os.environ["SITEMAP_INDEX_URL"]
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SHEET_TAB_NAME = os.environ.get("SHEET_TAB_NAME", "Sitemap URLs")
-CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -55,50 +52,8 @@ def get_sheet():
     try:
         ws = sh.worksheet(SHEET_TAB_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=SHEET_TAB_NAME, rows=10, cols=6)
+        ws = sh.add_worksheet(title=SHEET_TAB_NAME, rows=10, cols=2)
     return ws
-
-
-# ---------------------------------------------------------------------------
-# Extracción de datos HTML
-# ---------------------------------------------------------------------------
-def extract_title(html: str) -> str:
-    m = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-    return decode_entities(m.group(1).strip()) if m else ""
-
-
-def extract_h1(html: str) -> str:
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.IGNORECASE | re.DOTALL)
-    if not m:
-        return ""
-    text = re.sub(r"<[^>]+>", "", m.group(1)).strip()
-    return decode_entities(text)
-
-
-def extract_meta_description(html: str) -> str:
-    m = re.search(
-        r'<meta\s+name=["\']description["\']\s+content=["\'](.*?)["\']\s*/?>',
-        html,
-        re.IGNORECASE | re.DOTALL,
-    )
-    if not m:
-        m = re.search(
-            r'<meta\s+content=["\'](.*?)["\']\s+name=["\']description["\']\s*/?>',
-            html,
-            re.IGNORECASE | re.DOTALL,
-        )
-    return decode_entities(m.group(1).strip()) if m else ""
-
-
-def decode_entities(text: str) -> str:
-    return (
-        text.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", '"')
-        .replace("&#039;", "'")
-        .replace("&nbsp;", " ")
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,75 +100,30 @@ async def collect_all_urls(page, sitemap_index_url: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Scraping de cada página (con concurrencia limitada)
-# ---------------------------------------------------------------------------
-async def scrape_page(context, url: str, semaphore: asyncio.Semaphore) -> dict:
-    async with semaphore:
-        page = await context.new_page()
-        try:
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            if resp is None:
-                return {"url": url, "error": "sin respuesta"}
-            if resp.status >= 400:
-                return {"url": url, "error": f"HTTP {resp.status}"}
-            html = await page.content()
-            return {
-                "url": url,
-                "title": extract_title(html),
-                "h1": extract_h1(html),
-                "description": extract_meta_description(html),
-            }
-        except Exception as e:
-            return {"url": url, "error": str(e)}
-        finally:
-            await page.close()
-
-
-async def scrape_all_pages(context, urls: list[str]) -> list[dict]:
-    semaphore = asyncio.Semaphore(CONCURRENCY)
-    tasks = [scrape_page(context, u, semaphore) for u in urls]
-    results = []
-    for i, coro in enumerate(asyncio.as_completed(tasks), start=1):
-        result = await coro
-        results.append(result)
-        if i % 25 == 0 or i == len(urls):
-            print(f"[i] Procesadas {i}/{len(urls)} páginas", file=sys.stderr)
-    # as_completed no preserva el orden; lo reordenamos por URL de entrada
-    order = {u: idx for idx, u in enumerate(urls)}
-    results.sort(key=lambda r: order.get(r["url"], 0))
-    return results
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=UA, locale="es-ES")
+        page = await context.new_page()
 
-        index_page = await context.new_page()
-        urls = await collect_all_urls(index_page, SITEMAP_INDEX_URL)
-        await index_page.close()
-        print(f"[i] Total de URLs a procesar: {len(urls)}", file=sys.stderr)
+        urls = await collect_all_urls(page, SITEMAP_INDEX_URL)
 
-        results = await scrape_all_pages(context, urls)
         await browser.close()
+
+    print(f"[i] Total de URLs encontradas: {len(urls)}", file=sys.stderr)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    rows = [["URL", "Title", "H1", "Meta Description", "Estado", "Última comprobación"]]
-    for r in results:
-        if "error" in r:
-            rows.append([r["url"], "", "", "", f"Error: {r['error']}", now])
-        else:
-            rows.append([r["url"], r["title"], r["h1"], r["description"], "OK", now])
+    rows = [["URL", "Última comprobación"]]
+    rows.extend([u, now] for u in urls)
 
-    print("[i] Escribiendo en Google Sheets...", file=sys.stderr)
+    print("[i] Escribiendo en Google Sheets (se borra el contenido anterior)...", file=sys.stderr)
     ws = get_sheet()
     ws.clear()
     ws.update(values=rows, range_name="A1")
-    print(f"[✓] {len(rows) - 1} filas escritas en la pestaña '{SHEET_TAB_NAME}'", file=sys.stderr)
+    print(f"[✓] {len(rows) - 1} URLs escritas en la pestaña '{SHEET_TAB_NAME}'", file=sys.stderr)
 
 
 if __name__ == "__main__":
